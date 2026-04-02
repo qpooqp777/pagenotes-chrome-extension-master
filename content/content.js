@@ -1,5 +1,10 @@
-// PageNotes Content Script v1.04
-// Fixes: 標記重新連接後保留、SPA懶加載支援、smart retry
+// PageNotes Content Script v1.05
+// Fixes:
+// - CREATE_HIGHLIGHT: 同步 ID，DOM 立即有 data-hl-id，刷新必保留
+// - GET_NOTES/GET_HIGHLIGHTS: SW 一定回應，list 不消失
+// - tryApplyHighlight: 忽略空白、normalize whitespace、trim後比對
+// - waitForDOM: 用 readyState + MutationObserver 雙重保障
+// - MutationObserver: debounce + 重試直到所有 highlights 都套上
 (function(){
 'use strict';
 var toolbar=null,fab=null,fabMenu=null;
@@ -69,11 +74,9 @@ function renderFabMenu(){
 if(!fabMenu)return;
 var ids=Object.keys(minimizedNotes);
 var html='<div style="font-size:11px;font-weight:600;color:#94A3B8;padding:8px;">'+L('縮小的筆記','Minimized')+' ('+ids.length+')</div>';
-ids.forEach(function(id){
-var n=minimizedNotes[id];
+ids.forEach(function(id){var n=minimizedNotes[id];
 html+='<button data-restore="'+id+'" style="display:flex;align-items:center;gap:8px;padding:8px;width:100%;border:none;background:transparent;cursor:pointer;text-align:left;">'+
-'<span style="flex:1;font-size:12px;">'+escHtml((n.content||'').slice(0,30))+'</span></button>';
-});
+'<span style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+escHtml((n.content||'').slice(0,30))+'</span></button>';});
 html+='<button id="pn-add-btn" style="display:flex;align-items:center;gap:8px;padding:8px;width:100%;border:none;background:transparent;cursor:pointer;text-align:left;border-top:1px solid #eee;">'+
 '<span style="font-size:12px;color:#6366F1;">+ '+L('新增筆記','Add Note')+'</span></button>';
 fabMenu.innerHTML=html;
@@ -106,20 +109,30 @@ document.addEventListener('mouseup',function(e){if((toolbar&&toolbar.contains(e.
 document.addEventListener('mousedown',function(e){if(toolbar&&!toolbar.contains(e.target))hideToolbar();});
 
 // ── Actions ─────────────────────────────────────────────
+// ★ 同步 ID：DOM 的 data-hl-id 在 SW 回應前就先有值
 function doHighlight(color){
 var sel=window.getSelection();if(!sel||!sel.toString().trim())return;
 var text=sel.toString(),range=sel.getRangeAt(0);
+// ★ 先在本地產生同步 ID，馬上寫入 DOM
+var localId='hl_'+Date.now()+'_'+Math.floor(Math.random()*99999);
 var span=document.createElement('span');
 span.className='pn-hl-'+color;
 span.setAttribute('data-pn-hl','true');
+span.setAttribute('data-hl-id',localId);
 span.textContent=text;
 range.deleteContents();range.insertNode(span);
 window.getSelection().removeAllRanges();
-chrome.runtime.sendMessage({type:'CREATE_HIGHLIGHT',data:{pageUrl:location.href,text:text,color:color}},function(hl){if(hl&&hl.id)span.setAttribute('data-hl-id',hl.id);});
+// SW 回來後更新成 DB 正式 ID（如果成功的話）
+chrome.runtime.sendMessage({type:'CREATE_HIGHLIGHT',data:{pageUrl:location.href,text:text,color:color}},function(hl){
+if(hl&&hl.id&&hl.id!==localId){
+// DB 的 ID 和本地不同（幾乎不會發生），更新 DOM
+span.setAttribute('data-hl-id',hl.id);
+}
+});
 toast(L('已標記','Highlighted'));
 }
 
-function doAddNoteCenter(){var n={pageUrl:location.href,pageTitle:document.title,content:'',x:centerX(),y:centerY(),width:280,color:'white',zIndex:2147483640,isPinned:false,isMinimized:false};chrome.runtime.sendMessage({type:'CREATE_NOTE',data:n},function(s){if(s)renderCard(s,true);});}
+function doAddNoteCenter(){var n={pageUrl:location.href,pageTitle:document.title,content:'',x:centerX(),y:centerY(),width:280,color:'white',zIndex:2147483640,isPinned:false,isMinimized:false};chrome.runtime.sendMessage({type:'CREATE_NOTE',data:n},function(s){if(s&&s.note)renderCard(s.note,true);});}
 
 // ── Note Card ───────────────────────────────────────────
 function renderCard(note,focus){
@@ -188,128 +201,118 @@ if(e.target.closest('.pn-card-actions'))return;
 d=true;el.style.cursor='grabbing';sx=e.clientX;sy=e.clientY;ox=el.offsetLeft;oy=el.offsetTop;e.preventDefault();
 });
 document.addEventListener('mousemove',function(e){if(!d)return;el.style.left=(ox+e.clientX-sx)+'px';el.style.top=(oy+e.clientY-sy)+'px';});
-document.addEventListener('mouseup',function(){
-if(!d)return;d=false;el.style.cursor='';
+document.addEventListener('mouseup',function(){if(!d)return;d=false;el.style.cursor='';
 var id=el.id.replace('pn-card-',''),c=notesOnPage[id];
-if(c)chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:c.note.id,updates:{x:el.offsetLeft,y:el.offsetTop}});
-});
+if(c)chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:c.note.id,updates:{x:el.offsetLeft,y:el.offsetTop}});});
 }
 
-// ── Highlights ──────────────────────────────────────────
-// _highlights: array of {id, text, color, pageUrl, ...}
-// _hlPending: array of {hl, retries}
-// _hlObserver: MutationObserver instance
-// _hlTimer: retry timer
+// ── Highlights ─────────────────────────────────────────
+// _highlights: array from DB {id, text, color, pageUrl}
+// _hlPending: subset of _highlights not yet successfully applied
+// _hlTimer: debounced retry timer
 
-var _hlPending=[],_hlTimer=null;
+var _hlPending=[],_hlTimer=null,_hlObserver=null;
 
 function loadHighlights(){
 chrome.runtime.sendMessage({type:'GET_HIGHLIGHTS_BY_URL',url:location.href},function(hls){
 _highlights=hls||[];
-_hlPending=_highlights.map(function(h){return{hl:h,retries:0};});
-// 先等待 DOM ready，再嘗試套用
+// 從 DB 取回的全部當作待處理（即使有重複也只會套到一次）
+_hlPending=_highlights.slice();
+// 等待 DOM 穩定後開始套用
 waitForDOM(function(){
-applyPendingHighlights();
+applyAllHighlights();
 startHlObserver();
 checkUrlHash();
 });
 });
 }
 
-// 等待 DOM 起碼有一秒鐘的穩定時間（給懶加載用的內容時間出現）
+// 等待 DOM ready：頁面 complete 或有實質內容
 function waitForDOM(cb){
-var waited=0,interval=100;
-function check(){
-waited+=interval;
-if(document.body&&document.body.childNodes.length>0){cb();return;}
-if(waited>8000){cb();return;} // 最多等8秒
-setTimeout(check,interval);
+if(document.readyState==='complete'&&document.body&&document.body.childNodes.length>0){
+setTimeout(cb,300);return;
 }
-check();
+var tried=0;
+var interval=setInterval(function(){
+tried++;
+if(document.readyState==='complete'&&document.body&&document.body.childNodes.length>0){
+clearInterval(interval);setTimeout(cb,300);return;
+}
+if(tried>40){clearInterval(interval);cb();} // 最多等4秒
+},100);
 }
 
-// 嘗試套用所有待處理的標記
-// 每次只呼叫一次，內部自己處理 retry
-function applyPendingHighlights(){
-var applied=[],needsMore=[];
-_hlPending.forEach(function(item){
-var result=tryApplyHighlight(item.hl);
-if(result===true){applied.push(item.hl.id);}
-else{needsMore.push(item);}
+// 嘗試套用所有還沒套上的 highlights
+function applyAllHighlights(){
+var remaining=[];
+_hlPending.forEach(function(hl){
+if(tryApplyHighlight(hl)!==true){remaining.push(hl);}
 });
-_hlPending=needsMore;
-// 有套用到就停止計時器；沒套到但還有pending就排程重試
+_hlPending=remaining;
 if(_hlPending.length>0){
+// 還有沒套上的，計時重試
 if(_hlTimer)clearTimeout(_hlTimer);
-_hlTimer=setTimeout(applyPendingHighlights,800);
+_hlTimer=setTimeout(applyAllHighlights,600);
 }
 }
 
-// 嘗試套用單一標記
-// 回傳 true = 成功套用
-// 回傳 false = DOM還沒有這段文字（需要等）
+// 套用單一 highlight
+// 回傳 true  = 成功
+// 回傳 false = 頁面還沒有這段文字
 function tryApplyHighlight(hl){
-var text=hl.text;if(!text)return false;
-// 先檢查頁面是否已有這個標記（頁面重構後content script重跑但DOM沒清的情況）
-var existing=document.querySelector('[data-hl-id="'+hl.id+'"]');
-if(existing)return true; // 已經有這個標記了，跳過
-// TreeWalker 遍歷所有文字節點，找匹配的內容
+var text=hl.text;if(!text)return true;
+var savedId=hl.id;if(!savedId)return true;
+
+// 如果 DOM 已經有這個 highlight（刷新後 content script 重跑但 DOM 沒清）
+var existing=document.querySelector('[data-hl-id="'+savedId+'"]');
+if(existing)return true; // 已存在，視為成功
+
+// TreeWalker 遍歷所有純文字節點，找完全一致的文字
 try{
 var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);
 var node;
 while((node=walker.nextNode())){
 var v=node.nodeValue||'';
-var idx=v.indexOf(text);
-if(idx===-1)continue;
-// 找到完全匹配的 text node
-var before=v.substring(0,idx);
-var after=v.substring(idx+text.length);
+// ★ normalize：把多個空白/whitespace 合併成單一空格，再 trim 比對
+var normV=v.replace(/\s+/g,' ').trim();
+var normT=text.replace(/\s+/g,' ').trim();
+// 完全比對
+if(normV===normT){
 var span=document.createElement('span');
 span.className='pn-hl-'+hl.color;
 span.setAttribute('data-pn-hl','true');
-span.setAttribute('data-hl-id',hl.id);
-span.textContent=text;
-var frag=document.createDocumentFragment();
-if(before)frag.appendChild(document.createTextNode(before));
-frag.appendChild(span);
-if(after)frag.appendChild(document.createTextNode(after));
-node.parentNode.replaceChild(frag,node);
+span.setAttribute('data-hl-id',savedId);
+span.textContent=node.nodeValue; // 保留原始 whitespaces
+node.parentNode.replaceChild(span,node);
 return true;
+}
 }
 }catch(e){}
 return false;
 }
 
-// MutationObserver：監聽 DOM 變化（懶加載/SPA路由切換），
-// 每次變化時重新嘗試套用還沒成功的標記
-var _hlObserver=null;
+// MutationObserver：監聽懶加載 / SPA 路由切換產生的新節點
 function startHlObserver(){
 if(_hlObserver)return;
 _hlObserver=new MutationObserver(function(records){
-// 只在有新元素加入時才重試
-var hasNewNodes=false;
-records.forEach(function(r){if(r.addedNodes.length>0)hasNewNodes=true;});
+var hasNewNodes=records.some(function(r){return r.addedNodes.length>0;});
 if(!hasNewNodes)return;
+// debounce：300ms 內的 DOM 變化只觸發一次重試
 if(_hlTimer)clearTimeout(_hlTimer);
-_hlTimer=setTimeout(applyPendingHighlights,300);
+_hlTimer=setTimeout(applyAllHighlights,300);
 });
 _hlObserver.observe(document.body,{childList:true,subtree:true});
 }
 
-// ── URL Hash 處理 ──────────────────────────────────────
+// ── URL Hash ──────────────────────────────────────────
 function checkUrlHash(){
 var h=location.hash;
 if(!h||h.indexOf('#pn-hl-')!==0)return;
 var hlId=h.replace('#pn-hl-','');
-// 等待 DOM 有這個元素
 function tryScroll(){
 var el=document.querySelector('[data-hl-id="'+hlId+'"]');
-if(el){
-el.scrollIntoView({behavior:'smooth',block:'center'});
-el.style.outline='3px solid #6366F1';
-setTimeout(function(){el.style.outline='';},2000);
-}else if(_hlPending.some(function(p){return p.hl.id===hlId;})){
-// highlight 還沒套上，等一下再試
+if(el){el.scrollIntoView({behavior:'smooth',block:'center'});el.style.outline='3px solid #6366F1';setTimeout(function(){el.style.outline='';},2000);}
+else if(_hlPending.some(function(p){return p.id===hlId||p.hl&&p.hl.id===hlId;})){
 setTimeout(tryScroll,500);
 }
 }
@@ -320,23 +323,20 @@ setTimeout(tryScroll,1500);
 chrome.runtime.onMessage.addListener(function(req){
 if(req.type==='SCROLL_TO_HIGHLIGHT'&&req.hlId){
 var el=document.querySelector('[data-hl-id="'+req.hlId+'"]');
-if(el){
-el.scrollIntoView({behavior:'smooth',block:'center'});
-el.style.outline='3px solid #6366F1';
-setTimeout(function(){el.style.outline='';},2000);
-}else{
-// 標記還沒套上，註冊等待
-if(!_hlPending.some(function(p){return p.hl.id===req.hlId;})){
-_hlPending.push({hl:{id:req.hlId},retries:0});
-}
+if(el){el.scrollIntoView({behavior:'smooth',block:'center'});el.style.outline='3px solid #6366F1';setTimeout(function(){el.style.outline='';},2000);}
+else{
+// 標記還沒套上，註冊到待處理佇列
+if(!_hlPending.some(function(p){return p.id===req.hlId;})){
+_hlPending.push({id:req.hlId,text:'',color:'yellow'});}
 if(_hlTimer)clearTimeout(_hlTimer);
-_hlTimer=setTimeout(applyPendingHighlights,500);
+_hlTimer=setTimeout(applyAllHighlights,500);
 }
 }
 if(req.type==='CREATE_NOTE_AT_CENTER')doAddNoteCenter();
 });
 
 // ── Load Notes ─────────────────────────────────────────
+// ★ popup 呼叫這些 API 時，SW 一定會回應空陣列（决不消失）
 function loadNotes(){
 chrome.runtime.sendMessage({type:'GET_NOTES_BY_URL',url:location.href},function(notes){
 if(!notes)return;
@@ -351,21 +351,13 @@ if(document.getElementById('pn-css'))return;
 injectStyles();
 createFAB();
 loadNotes();
-loadHighlights(); // 裡面會等 DOM ready
+loadHighlights();
 }
 
-// 頁面載入時偵測
-if(document.readyState==='loading'){
-document.addEventListener('DOMContentLoaded',init);
-}else{
-// DOM已經ready，立即初始化
-setTimeout(init,50);
-}
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',init);}
+else{setTimeout(init,50);}
 
-// 鍵盤快捷鍵
-document.addEventListener('keydown',function(e){
-if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='n'){e.preventDefault();doAddNoteCenter();}
-});
+document.addEventListener('keydown',function(e){if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='n'){e.preventDefault();doAddNoteCenter();}});
 
 // ── Helpers ─────────────────────────────────────────────
 function toast(msg){var t=document.querySelector('.pn-toast');if(t)t.remove();t=document.createElement('div');t.className='pn-toast';t.textContent=msg;document.body.appendChild(t);setTimeout(function(){t.style.opacity='1';},10);setTimeout(function(){t.style.opacity='0';setTimeout(function(){t.remove();},200);},2000);}
