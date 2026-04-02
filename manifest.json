@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PageNotes",
-  "version": "1.06",
+  "version": "1.07",
   "description": "📝 在任意網頁上自由拖曳新增筆記、標記重點，支援 Markdown，自動連結到頁面 URL",
   "permissions": [
     "activeTab",

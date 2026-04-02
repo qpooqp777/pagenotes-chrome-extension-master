@@ -272,39 +272,48 @@ _hlTimer=setTimeout(applyAllHighlights,600);
 }
 }
 
-// 套用單一 highlight
-// 回傳 true  = 成功
-// 回傳 false = 頁面還沒有這段文字
+// 套用單一 highlight — 子字串搜尋
+// 回傳 true = 成功（至少套到一個）
 function tryApplyHighlight(hl){
 var text=hl.text;if(!text)return true;
 var savedId=hl.id;if(!savedId)return true;
+if(document.querySelector('[data-hl-id="'+savedId+'"]'))return true;
 
-// 如果 DOM 已經有這個 highlight（刷新後 content script 重跑但 DOM 沒清）
-var existing=document.querySelector('[data-hl-id="'+savedId+'"]');
-if(existing)return true; // 已存在，視為成功
+// normalize keyword
+var kw=text.replace(/\s+/g,' ').trim();
+if(!kw)return true;
 
-// TreeWalker 遍歷所有純文字節點，找完全一致的文字
+var applied=false;
 try{
 var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);
 var node;
 while((node=walker.nextNode())){
 var v=node.nodeValue||'';
-// ★ normalize：把多個空白/whitespace 合併成單一空格，再 trim 比對
-var normV=v.replace(/\s+/g,' ').trim();
-var normT=text.replace(/\s+/g,' ').trim();
-// 完全比對
-if(normV===normT){
+if(!v)continue;
+var lowerV=v.toLowerCase(), lowerKw=kw.toLowerCase();
+var pos=0;
+while(true){
+var idx=lowerV.indexOf(lowerKw,pos);
+if(idx===-1)break;
+var before=v.substring(0,idx);
+var matched=v.substring(idx,idx+kw.length);
+var after=v.substring(idx+kw.length);
 var span=document.createElement('span');
 span.className='pn-hl-'+hl.color;
 span.setAttribute('data-pn-hl','true');
 span.setAttribute('data-hl-id',savedId);
-span.textContent=node.nodeValue; // 保留原始 whitespaces
-node.parentNode.replaceChild(span,node);
-return true;
+span.textContent=matched;
+var frag=document.createDocumentFragment();
+if(before)frag.appendChild(document.createTextNode(before));
+frag.appendChild(span);
+if(after)frag.appendChild(document.createTextNode(after));
+node.parentNode.replaceChild(frag,node);
+applied=true;
+pos=idx+1;
 }
 }
 }catch(e){}
-return false;
+return applied;
 }
 
 // MutationObserver：監聽懶加載 / SPA 路由切換產生的新節點
