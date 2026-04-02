@@ -1,257 +1,259 @@
-// notes-db.js — PageNotes IndexedDB CRUD
-// ============================================================
+// notes-db.js — PageNotes IndexedDB CRUD (唯一 DB 層)
+// ==============================================================
+// 所有 IndexedDB 操作集中在此檔案，background.js 依賴它。
+// 注意：Chrome Extension Service Worker 無法使用 ES module，
+// 故以 IIFE 封裝，暴露全域工廠函式。
+(function (root) {
+  'use strict';
 
-var DB_NAME = "PageNotesDB";
-var DB_VERSION = 1;
-var db = null;
+  var DB_NAME = 'PageNotesDB';
+  var DB_VERSION = 1;
+  var _db = null;
+  var _ready = false;
+  var _pending = []; // DB 未就緒時的排隊回呼
 
-// ─── Init ────────────────────────────────────────────────────
-
-function initDB(callback) {
-    if (typeof indexedDB === "undefined") { callback && callback(null); return; }
+  // ─── Init ────────────────────────────────────────────────────
+  function initDB(cb) {
+    if (_ready && _db) { cb && cb(_db); return; }
+    if (typeof indexedDB === 'undefined') { cb && cb(null); return; }
     var req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onerror = function(e) { console.error("[PageNotes] DB error:", e); callback && callback(null); };
-    req.onsuccess = function(e) {
-        db = e.target.result;
-        console.log("[PageNotes] DB ready");
-        callback && callback(db);
+    req.onerror = function (e) {
+      console.error('[PN] DB open error', e);
+      cb && cb(null);
     };
-    req.onupgradeneeded = function(e) {
-        var d = e.target.result;
-
-        // notes store
-        if (!d.objectStoreNames.contains("notes")) {
-            var ns = d.createObjectStore("notes", { keyPath: "id" });
-            ns.createIndex("pageUrl", "pageUrl", { unique: false });
-            ns.createIndex("updatedAt", "updatedAt", { unique: false });
-        }
-
-        // highlights store
-        if (!d.objectStoreNames.contains("highlights")) {
-            var hs = d.createObjectStore("highlights", { keyPath: "id" });
-            hs.createIndex("pageUrl", "pageUrl", { unique: false });
-        }
-
-        // settings store
-        if (!d.objectStoreNames.contains("settings")) {
-            d.createObjectStore("settings", { keyPath: "key" });
-        }
+    req.onsuccess = function (e) {
+      _db = e.target.result;
+      _ready = true;
+      console.log('[PN] DB ready');
+      // 釋放排隊的回呼
+      _pending.forEach(function (f) { f(_db); });
+      _pending = [];
+      cb && cb(_db);
     };
-}
+    req.onupgradeneeded = function (e) {
+      var d = e.target.result;
+      if (!d.objectStoreNames.contains('notes')) {
+        var ns = d.createObjectStore('notes', { keyPath: 'id' });
+        ns.createIndex('pageUrl', 'pageUrl', { unique: false });
+        ns.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+      if (!d.objectStoreNames.contains('highlights')) {
+        var hs = d.createObjectStore('highlights', { keyPath: 'id' });
+        hs.createIndex('pageUrl', 'pageUrl', { unique: false });
+      }
+      if (!d.objectStoreNames.contains('settings')) {
+        d.createObjectStore('settings', { keyPath: 'key' });
+      }
+    };
+  }
 
-function getOS(name, mode) {
-    if (!db) return null;
-    return db.transaction(name, mode || "readonly").objectStore(name);
-}
+  // ─── 內部：排隊式 DB 取得 ────────────────────────────────────
+  function withDB(cb) {
+    if (_ready && _db) { cb(_db); }
+    else { _pending.push(cb); }
+  }
 
-function upsert(storeName, data, callback) {
-    var s = getOS(storeName, "readwrite");
-    if (!s) { callback && callback(false); return; }
-    var r = s.put(data);
-    r.onsuccess = function() { callback && callback(true); };
-    r.onerror = function() { callback && callback(false); };
-}
+  // ─── 低層 CRUD ──────────────────────────────────────────────
+  function getOS(name, mode) {
+    if (!_db) return null;
+    try {
+      return _db.transaction(name, mode || 'readonly').objectStore(name);
+    } catch (e) { return null; }
+  }
 
-function remove(storeName, key, callback) {
-    var s = getOS(storeName, "readwrite");
-    if (!s) { callback && callback(false); return; }
-    var r = s.delete(key);
-    r.onsuccess = function() { callback && callback(true); };
-    r.onerror = function() { callback && callback(false); };
-}
+  function _put(storeName, data, cb) {
+    var s = getOS(storeName, 'readwrite');
+    if (!s) { cb && cb(false); return; }
+    var r = data.id !== undefined ? s.put(data) : s.add(data);
+    r.onsuccess = function () { cb && cb(true); };
+    r.onerror = function () { cb && cb(false); };
+  }
 
-function getByKey(storeName, key, callback) {
+  function _delete(storeName, key, cb) {
+    var s = getOS(storeName, 'readwrite');
+    if (!s) { cb && cb(false); return; }
+    s.delete(key);
+    cb && cb(true);
+  }
+
+  function _get(storeName, key, cb) {
     var s = getOS(storeName);
-    if (!s) { callback && callback(null); return; }
+    if (!s) { cb && cb(null); return; }
     var r = s.get(key);
-    r.onsuccess = function(e) { callback && callback(e.target.result || null); };
-    r.onerror = function() { callback && callback(null); };
-}
+    r.onsuccess = function (e) { cb && cb(e.target.result || null); };
+    r.onerror = function () { cb && cb(null); };
+  }
 
-function getAll(storeName, callback) {
+  function _getAll(storeName, cb) {
     var s = getOS(storeName);
-    if (!s) { callback && callback([]); return; }
+    if (!s) { cb && cb([]); return; }
     var r = s.getAll();
-    r.onsuccess = function(e) { callback && callback(e.target.result || []); };
-    r.onerror = function() { callback && callback([]); };
-}
+    r.onsuccess = function (e) { cb && cb(e.target.result || []); };
+    r.onerror = function () { cb && cb([]); };
+  }
 
-function getByIndex(storeName, index, value, callback) {
+  function _getAllByIndex(storeName, index, value, cb) {
     var s = getOS(storeName);
-    if (!s) { callback && callback([]); return; }
-    var idx = s.index(index);
-    var r = idx.getAll(value);
-    r.onsuccess = function(e) { callback && callback(e.target.result || []); };
-    r.onerror = function() { callback && callback([]); };
-}
+    if (!s) { cb && cb([]); return; }
+    try {
+      var r = s.index(index).getAll(value);
+      r.onsuccess = function (e) { cb && cb(e.target.result || []); };
+      r.onerror = function () { cb && cb([]); };
+    } catch (e) { cb && cb([]); }
+  }
 
-function getAllFromStore(storeName, callback) {
-    var s = getOS(storeName);
-    if (!s) { callback && callback([]); return; }
-    var r = s.getAll();
-    r.onsuccess = function(e) { callback && callback(e.target.result || []); };
-    r.onerror = function() { callback && callback([]); };
-}
-
-// ─── Note CRUD ───────────────────────────────────────────────
-
-function createNote(data, callback) {
+  // ─── Note API ───────────────────────────────────────────────
+  function createNote(data, cb) {
     var note = {
-        id: "note_" + Date.now(),
-        pageUrl: data.pageUrl || "",
-        pageTitle: data.pageTitle || "",
-        content: data.content || "",
-        x: data.x !== undefined ? data.x : 100,
-        y: data.y !== undefined ? data.y : 100,
-        width: data.width || 280,
-        color: data.color || "white",
-        zIndex: data.zIndex || 100,
-        isPinned: false,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
+      id: 'note_' + Date.now() + '_' + Math.floor(Math.random() * 99999),
+      pageUrl: data.pageUrl || '',
+      pageTitle: data.pageTitle || '',
+      content: data.content || '',
+      x: data.x !== undefined ? data.x : 100,
+      y: data.y !== undefined ? data.y : 100,
+      width: data.width || 280,
+      color: data.color || 'white',
+      zIndex: data.zIndex || 2147483640,
+      isPinned: false,
+      isMinimized: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
     };
-    upsert("notes", note, function(ok) {
-        callback && callback(ok ? note : null);
+    _put('notes', note, function (ok) { cb && cb(ok ? note : null); });
+  }
+
+  function updateNote(id, updates, cb) {
+    _get('notes', id, function (note) {
+      if (!note) { cb && cb(null); return; }
+      Object.keys(updates).forEach(function (k) { note[k] = updates[k]; });
+      note.updatedAt = Date.now();
+      _put('notes', note, function (ok) { cb && cb(ok ? note : null); });
     });
-}
+  }
 
-function updateNote(id, updates, callback) {
-    getByKey("notes", id, function(note) {
-        if (!note) { callback && callback(null); return; }
-        var keys = Object.keys(updates);
-        for (var i = 0; i < keys.length; i++) {
-            note[keys[i]] = updates[keys[i]];
-        }
-        note.updatedAt = Date.now();
-        upsert("notes", note, function(ok) {
-            callback && callback(ok ? note : null);
-        });
+  function deleteNote(id, cb) {
+    _delete('notes', id, cb);
+  }
+
+  function getNotesByUrl(url, cb) {
+    _getAllByIndex('notes', 'pageUrl', url, cb);
+  }
+
+  function getAllNotes(cb) { _getAll('notes', cb); }
+
+  function getAllNotesSorted(cb) {
+    _getAll('notes', function (notes) {
+      notes.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+      cb && cb(notes);
     });
-}
+  }
 
-function deleteNote(id, callback) {
-    remove("notes", id, callback);
-}
-
-function getNotesByUrl(pageUrl, callback) {
-    getByIndex("notes", "pageUrl", pageUrl, callback);
-}
-
-function getAllNotes(callback) {
-    getAllFromStore("notes", callback);
-}
-
-function getAllNotesSorted(callback) {
-    getAllFromStore("notes", function(notes) {
-        notes.sort(function(a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
-        callback && callback(notes);
-    });
-}
-
-// ─── Highlight CRUD ─────────────────────────────────────────
-
-function createHighlight(data, callback) {
+  // ─── Highlight API ─────────────────────────────────────────
+  function createHighlight(data, cb) {
     var hl = {
-        id: "hl_" + Date.now(),
-        pageUrl: data.pageUrl || "",
-        selector: data.selector || "",
-        startOffset: data.startOffset || 0,
-        endOffset: data.endOffset || 0,
-        text: data.text || "",
-        color: data.color || "yellow",
-        noteId: data.noteId || null,
-        createdAt: Date.now()
+      id: 'hl_' + Date.now() + '_' + Math.floor(Math.random() * 99999),
+      pageUrl: data.pageUrl || '',
+      selector: data.selector || '',
+      text: data.text || '',
+      color: data.color || 'yellow',
+      noteId: data.noteId || null,
+      createdAt: Date.now()
     };
-    upsert("highlights", hl, function(ok) {
-        callback && callback(ok ? hl : null);
+    _put('highlights', hl, function (ok) { cb && cb(ok ? hl : null); });
+  }
+
+  function deleteHighlight(id, cb) { _delete('highlights', id, cb); }
+
+  function getHighlightsByUrl(url, cb) {
+    _getAllByIndex('highlights', 'pageUrl', url, cb);
+  }
+
+  function getAllHighlights(cb) { _getAll('highlights', cb); }
+
+  // ─── Settings API ───────────────────────────────────────────
+  function saveSetting(k, v, cb) {
+    _put('settings', { key: k, value: v }, cb);
+  }
+
+  function getSetting(k, dv, cb) {
+    _get('settings', k, function (r) { cb && cb(r ? r.value : dv); });
+  }
+
+  function getAllSettings(cb) {
+    _getAll('settings', function (recs) {
+      var s = {};
+      if (recs && recs.length) recs.forEach(function (r) { s[r.key] = r.value; });
+      cb && cb(s);
     });
-}
+  }
 
-function deleteHighlight(id, callback) {
-    remove("highlights", id, callback);
-}
-
-function getHighlightsByUrl(pageUrl, callback) {
-    getByIndex("highlights", "pageUrl", pageUrl, callback);
-}
-
-function getAllHighlights(callback) {
-    getAllFromStore("highlights", callback);
-}
-
-// ─── Settings ────────────────────────────────────────────────
-
-function saveSetting(key, value, callback) {
-    upsert("settings", { key: key, value: value }, callback);
-}
-
-function getSetting(key, defaultVal, callback) {
-    getByKey("settings", key, function(rec) {
-        callback && callback(rec ? rec.value : defaultVal);
+  // ─── Data Management ────────────────────────────────────────
+  function exportAllData(cb) {
+    _getAll('notes', function (notes) {
+      _getAll('highlights', function (hls) {
+        cb && cb({ notes: notes, highlights: hls, exportedAt: new Date().toISOString() });
+      });
     });
-}
+  }
 
-function getAllSettings(callback) {
-    getAllFromStore("settings", function(recs) {
-        var s = {};
-        if (recs && recs.length) recs.forEach(function(r) { s[r.key] = r.value; });
-        callback && callback(s);
-    });
-}
-
-// ─── Export / Import ────────────────────────────────────────
-
-function exportAllData(callback) {
-    getAllFromStore("notes", function(notes) {
-        getAllFromStore("highlights", function(highlights) {
-            callback && callback({ notes: notes, highlights: highlights, exportedAt: new Date().toISOString() });
-        });
-    });
-}
-
-function importData(data, callback) {
-    var pending = 0, done = 0, errors = 0;
-    if (!data) { callback && callback(false); return; }
-
-    if (data.notes && data.notes.length) {
-        pending++;
-        data.notes.forEach(function(n) { upsert("notes", n, function(ok) { if (!ok) errors++; done++; if (done === pending) callback && callback(errors === 0); }); });
-    }
-    if (data.highlights && data.highlights.length) {
-        pending++;
-        data.highlights.forEach(function(h) { upsert("highlights", h, function(ok) { if (!ok) errors++; done++; if (done === pending) callback && callback(errors === 0); }); });
-    }
-    if (pending === 0) callback && callback(true);
-}
-
-function clearAllData(callback) {
-    var stores = ["notes", "highlights", "settings"];
+  function clearAllData(cb) {
+    var stores = ['notes', 'highlights', 'settings'];
     var p = stores.length, d = 0;
-    stores.forEach(function(n) {
-        var s = getOS(n, "readwrite");
-        if (s) { var r = s.clear(); r.onsuccess = function() { d++; if (d === p) callback && callback(true); }; }
-        else { d++; if (d === p) callback && callback(true); }
+    stores.forEach(function (n) {
+      var s = getOS(n, 'readwrite');
+      if (s) { s.clear(); }
+      d++;
+      if (d === p) cb && cb(true);
     });
-}
+  }
 
-// ─── Stats ─────────────────────────────────────────────────
-
-function getStats(callback) {
-    getAllFromStore("notes", function(notes) {
-        getAllFromStore("highlights", function(hls) {
-            var pages = {};
-            notes.forEach(function(n) {
-                if (n.pageUrl) {
-                    var host = n.pageUrl.match(/https?:\/\/([^\/]+)/);
-                    if (host) pages[host[1]] = (pages[host[1]] || 0) + 1;
-                }
-            });
-            callback && callback({
-                totalNotes: notes.length,
-                totalHighlights: hls.length,
-                totalPages: Object.keys(pages).length,
-                topPages: Object.entries(pages).sort(function(a, b) { return b[1] - a[1]; }).slice(0, 5)
-            });
+  function getStats(cb) {
+    _getAll('notes', function (notes) {
+      _getAll('highlights', function (hls) {
+        var pages = {};
+        notes.forEach(function (n) {
+          var m = n.pageUrl && n.pageUrl.match(/https?:\/\/([^\/]+)/);
+          if (m) pages[m[1]] = (pages[m[1]] || 0) + 1;
         });
+        var sorted = Object.entries(pages).sort(function (a, b) { return b[1] - a[1]; });
+        cb && cb({
+          totalNotes: notes.length,
+          totalHighlights: hls.length,
+          totalPages: Object.keys(pages).length,
+          topPages: sorted.slice(0, 5)
+        });
+      });
     });
-}
+  }
+
+  // ─── Export ────────────────────────────────────────────────
+  root.PNDB = {
+    init: initDB,
+    isReady: function () { return _ready; },
+    note: {
+      create: createNote,
+      update: updateNote,
+      delete: deleteNote,
+      getByUrl: getNotesByUrl,
+      getAll: getAllNotes,
+      getAllSorted: getAllNotesSorted
+    },
+    highlight: {
+      create: createHighlight,
+      delete: deleteHighlight,
+      getByUrl: getHighlightsByUrl,
+      getAll: getAllHighlights
+    },
+    settings: {
+      save: saveSetting,
+      get: getSetting,
+      getAll: getAllSettings
+    },
+    data: {
+      export: exportAllData,
+      clear: clearAllData,
+      stats: getStats
+    }
+  };
+
+})(typeof globalThis !== 'undefined' ? globalThis : window);
