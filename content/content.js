@@ -86,8 +86,8 @@ var ab=fabMenu.querySelector('#pn-add-btn');if(ab)ab.addEventListener('click',fu
 
 function updateFabBadge(){var b=fab&&fab.querySelector('.pn-fab-badge');if(b)b.remove();var c=Object.keys(minimizedNotes).length;if(c>0&&fab){var bd=document.createElement('span');bd.className='pn-fab-badge';bd.textContent=c;fab.appendChild(bd);}}
 
-function minimizeNote(id){var c=notesOnPage[id];if(!c)return;var n=c.note;n.isMinimized=true;minimizedNotes[id]=n;c.el.style.opacity='0';setTimeout(function(){if(c.el.parentNode)c.el.parentNode.removeChild(c.el);},200);delete notesOnPage[id];chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:id,updates:{isMinimized:true}});updateFabBadge();toast(L('已縮小','Minimized'));}
-function restoreNote(id){var n=minimizedNotes[id];if(!n)return;delete minimizedNotes[id];chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:id,updates:{isMinimized:false}});n.x=centerX();n.y=centerY();renderCard(n,true);updateFabBadge();}
+function minimizeNote(id){var c=notesOnPage[id];if(!c)return;var n=c.note;n.isMinimized=true;minimizedNotes[id]=n;c.el.style.opacity='0';setTimeout(function(){if(c.el.parentNode)c.el.parentNode.removeChild(c.el);},200);delete notesOnPage[id];_msg({type:'UPDATE_NOTE',id:id,updates:{isMinimized:true}});updateFabBadge();toast(L('已縮小','Minimized'));}
+function restoreNote(id){var n=minimizedNotes[id];if(!n)return;delete minimizedNotes[id];_msg({type:'UPDATE_NOTE',id:id,updates:{isMinimized:false}});n.x=centerX();n.y=centerY();renderCard(n,true);updateFabBadge();}
 
 // ── Toolbar ─────────────────────────────────────────────
 function createToolbar(){
@@ -123,7 +123,7 @@ span.textContent=text;
 range.deleteContents();range.insertNode(span);
 window.getSelection().removeAllRanges();
 // SW 回來後更新成 DB 正式 ID（如果成功的話）
-chrome.runtime.sendMessage({type:'CREATE_HIGHLIGHT',data:{pageUrl:location.href,text:text,color:color}},function(hl){
+_msg({type:'CREATE_HIGHLIGHT',data:{pageUrl:location.href,text:text,color:color}},function(hl){
 if(hl&&hl.id&&hl.id!==localId){
 // DB 的 ID 和本地不同（幾乎不會發生），更新 DOM
 span.setAttribute('data-hl-id',hl.id);
@@ -132,7 +132,7 @@ span.setAttribute('data-hl-id',hl.id);
 toast(L('已標記','Highlighted'));
 }
 
-function doAddNoteCenter(){var n={pageUrl:location.href,pageTitle:document.title,content:'',x:centerX(),y:centerY(),width:280,color:'white',zIndex:2147483640,isPinned:false,isMinimized:false};chrome.runtime.sendMessage({type:'CREATE_NOTE',data:n},function(s){if(s&&s.note)renderCard(s.note,true);});}
+function doAddNoteCenter(){var n={pageUrl:location.href,pageTitle:document.title,content:'',x:centerX(),y:centerY(),width:280,color:'white',zIndex:2147483640,isPinned:false,isMinimized:false};_msg({type:'CREATE_NOTE',data:n},function(s){if(s&&s.note)renderCard(s.note,true);});}
 
 // ── Note Card ───────────────────────────────────────────
 function renderCard(note,focus){
@@ -167,7 +167,7 @@ b.innerHTML='<textarea placeholder="'+L('寫下筆記...','Write note...')+'">'+
 var ta=b.querySelector('textarea');ta.focus();ta.select();
 ta.addEventListener('blur',function(){
 note.content=ta.value;note.updatedAt=Date.now();
-chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:note.id,updates:{content:ta.value,updatedAt:note.updatedAt}});
+_msg({type:'UPDATE_NOTE',id:note.id,updates:{content:ta.value,updatedAt:note.updatedAt}});
 refreshCard(card,note,false);
 });
 ta.addEventListener('keydown',function(e){if(e.key==='Escape')ta.blur();});
@@ -184,11 +184,11 @@ makeDraggable(card,h);
 card.addEventListener('mousedown',function(){bringToFront(note.id);});
 card.querySelector('.pin-btn').addEventListener('click',function(e){e.stopPropagation();
 note.isPinned=!note.isPinned;card.classList.toggle('is-pinned',note.isPinned);
-chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:note.id,updates:{isPinned:note.isPinned}});});
+_msg({type:'UPDATE_NOTE',id:note.id,updates:{isPinned:note.isPinned}});});
 card.querySelector('.min-btn').addEventListener('click',function(e){e.stopPropagation();minimizeNote(note.id);});
 card.querySelector('.del-btn').addEventListener('click',function(e){e.stopPropagation();
 if(confirm(L('刪除此筆記？','Delete this note?'))){
-chrome.runtime.sendMessage({type:'DELETE_NOTE',id:note.id});
+_msg({type:'DELETE_NOTE',id:note.id});
 card.style.opacity='0';setTimeout(function(){if(card.parentNode)card.parentNode.removeChild(card);},200);
 delete notesOnPage[note.id];}});
 h.addEventListener('dblclick',function(){refreshCard(card,note,true);});
@@ -203,7 +203,7 @@ d=true;el.style.cursor='grabbing';sx=e.clientX;sy=e.clientY;ox=el.offsetLeft;oy=
 document.addEventListener('mousemove',function(e){if(!d)return;el.style.left=(ox+e.clientX-sx)+'px';el.style.top=(oy+e.clientY-sy)+'px';});
 document.addEventListener('mouseup',function(){if(!d)return;d=false;el.style.cursor='';
 var id=el.id.replace('pn-card-',''),c=notesOnPage[id];
-if(c)chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:c.note.id,updates:{x:el.offsetLeft,y:el.offsetTop}});});
+if(c)_msg({type:'UPDATE_NOTE',id:c.note.id,updates:{x:el.offsetLeft,y:el.offsetTop}});});
 }
 
 // ── Highlights ─────────────────────────────────────────
@@ -211,14 +211,30 @@ if(c)chrome.runtime.sendMessage({type:'UPDATE_NOTE',id:c.note.id,updates:{x:el.o
 // _hlPending: subset of _highlights not yet successfully applied
 // _hlTimer: debounced retry timer
 
-var _hlPending=[],_hlTimer=null,_hlObserver=null;
+var _hlPending=[],_hlTimer=null,_hlObserver=null,_alive=true;
 
+// ★ Safe sendMessage：context invalidated 後不拋錯，並停用所有計時器
+function _msg(msg,cb){
+if(!_alive)return;
+try{
+chrome.runtime.sendMessage(msg,function(res){
+if(!_alive)return;
+try{if(cb)cb(res);}catch(e){}
+});
+}catch(e){_alive=false;}
+}
+// 頁面卸載時停用所有計時器（Facebook SPA 導航會觸發）
+window.addEventListener("unload",function(){
+_alive=false;
+if(_hlTimer)clearTimeout(_hlTimer);
+if(_hlObserver){try{_hlObserver.disconnect();}catch(e){}}
+});
+
+// ── Highlights ─────────────────────────────────────────
 function loadHighlights(){
-chrome.runtime.sendMessage({type:'GET_HIGHLIGHTS_BY_URL',url:location.href},function(hls){
+_msg({type:'GET_HIGHLIGHTS_BY_URL',url:location.href},function(hls){
 _highlights=hls||[];
-// 從 DB 取回的全部當作待處理（即使有重複也只會套到一次）
 _hlPending=_highlights.slice();
-// 等待 DOM 穩定後開始套用
 waitForDOM(function(){
 applyAllHighlights();
 startHlObserver();
@@ -227,7 +243,7 @@ checkUrlHash();
 });
 }
 
-// 等待 DOM ready：頁面 complete 或有實質內容
+// 等待 DOM ready
 function waitForDOM(cb){
 if(document.readyState==='complete'&&document.body&&document.body.childNodes.length>0){
 setTimeout(cb,300);return;
@@ -238,7 +254,7 @@ tried++;
 if(document.readyState==='complete'&&document.body&&document.body.childNodes.length>0){
 clearInterval(interval);setTimeout(cb,300);return;
 }
-if(tried>40){clearInterval(interval);cb();} // 最多等4秒
+if(tried>40){clearInterval(interval);cb();}
 },100);
 }
 
@@ -338,7 +354,7 @@ if(req.type==='CREATE_NOTE_AT_CENTER')doAddNoteCenter();
 // ── Load Notes ─────────────────────────────────────────
 // ★ popup 呼叫這些 API 時，SW 一定會回應空陣列（决不消失）
 function loadNotes(){
-chrome.runtime.sendMessage({type:'GET_NOTES_BY_URL',url:location.href},function(notes){
+_msg({type:'GET_NOTES_BY_URL',url:location.href},function(notes){
 if(!notes)return;
 notes.forEach(function(n){if(n.isMinimized){minimizedNotes[n.id]=n;}else{renderCard(n,false);}});
 updateFabBadge();
